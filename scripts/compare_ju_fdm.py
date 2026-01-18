@@ -1,6 +1,11 @@
 import os
+import sys
 import time
 import matplotlib
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 matplotlib.use("Agg")
 
@@ -8,11 +13,11 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from ju_1998 import Ju1998Pricing
-from kim_jang_iter import KimJangIterative
-from gauss_kronrod import GKRule
-from american_put_gk import AmericanPutBoundaryGK
-from boundary_estimator_piecewise import (
+from american_options.ju_1998 import Ju1998Pricing
+from american_options.kim_jang_iter import KimJangIterative
+from american_options.gauss_kronrod import GKRule
+from american_options.american_put_gk import AmericanPutBoundaryGK
+from american_options.boundary_estimator_piecewise import (
     gauss_newton_bspline,
     build_bspline_knots,
     build_bspline_basis_matrix,
@@ -23,6 +28,13 @@ from boundary_estimator_piecewise import (
 GLOBAL_M=300
 GLOBAL_N=600
 GLOBAL_MAX_ITER=50
+
+
+def _output_path(filename):
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out_dir = os.path.join(repo_root, "outputs")
+    os.makedirs(out_dir, exist_ok=True)
+    return os.path.join(out_dir, filename)
 
 
 def _make_time_grid(T, n_steps, cluster_power=2.5):
@@ -348,7 +360,7 @@ def plot_boundary_comparison():
         ax.set_title(f"EEB Comparison ({case['label']})")
         ax.legend()
 
-    out_path = os.path.join(os.path.dirname(__file__), "eeb_comparison_2.png")
+    out_path = _output_path("eeb_comparison_2.png")
     plt.tight_layout()
     plt.savefig(out_path, dpi=200)
     print(f"Saved plot: {out_path}")
@@ -404,7 +416,7 @@ def plot_call_boundary_comparison():
     ax.set_title("Call EEB Comparison")
     ax.legend()
 
-    out_path = os.path.join(os.path.dirname(__file__), "call_eeb_comparison.png")
+    out_path = _output_path("call_eeb_comparison.png")
     plt.tight_layout()
     plt.savefig(out_path, dpi=200)
     print(f"Saved plot: {out_path}")

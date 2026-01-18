@@ -2,7 +2,7 @@ import numpy as np
 from scipy.stats import norm
 from scipy.optimize import brentq
 
-from gauss_kronrod import GaussKronrodRule, GKRule
+from .gauss_kronrod import GaussKronrodRule, GKRule
 
 
 class KimJangIterative:

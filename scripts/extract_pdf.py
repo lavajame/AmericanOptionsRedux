@@ -27,13 +27,16 @@ def extract_text(pdf_path, output_path):
     return True
 
 if __name__ == "__main__":
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    papers_dir = os.path.join(repo_root, "docs", "papers")
     files = ["Ju_1999.pdf", "ssrn-362.pdf"]
     for f in files:
-        if os.path.exists(f):
-            out = f.replace(".pdf", ".txt")
-            if extract_text(f, out):
-                print(f"Extracted {f} to {out}")
+        pdf_path = os.path.join(papers_dir, f)
+        if os.path.exists(pdf_path):
+            out = os.path.join(papers_dir, f.replace(".pdf", ".txt"))
+            if extract_text(pdf_path, out):
+                print(f"Extracted {pdf_path} to {out}")
             else:
-                print(f"Failed to extract {f}")
+                print(f"Failed to extract {pdf_path}")
         else:
-            print(f"File {f} not found")
+            print(f"File {pdf_path} not found")

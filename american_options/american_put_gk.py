@@ -6,7 +6,7 @@ from typing import Callable, Iterable, List, Tuple, cast
 
 import numpy as np
 
-from gauss_kronrod import GaussKronrodRule, GKRule
+from .gauss_kronrod import GaussKronrodRule, GKRule
 
 
 def norm_cdf(x: float) -> float:
@@ -1324,7 +1324,7 @@ def plot_discrete_div_boundary_comparison(
     import matplotlib.pyplot as plt
     import csv
 
-    from fd_pricer import FiniteDifferenceAmerican
+    from .fd_pricer import FiniteDifferenceAmerican
 
     model = AmericanPutBoundaryGK(K=K, r=r, q=q, sigma=sigma, T=T)
     segment_info: List[dict] = []
@@ -1503,7 +1503,7 @@ def plot_discrete_div_boundary_comparison(
             for t_val, tau_val, b_val in zip(t_gk, tau_grid, b_fd_interp):
                 writer.writerow([f"{t_val:.16f}", f"{tau_val:.16f}", f"{b_val:.16f}"])
 
-from ju_1998 import Ju1998Pricing
+from .ju_1998 import Ju1998Pricing
 
 if __name__ == "__main__":
     model = AmericanPutBoundaryGK(K=100, r=0.01, q=0.02, sigma=0.1, T=1.0)

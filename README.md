@@ -12,16 +12,17 @@ This repository contains research-grade Python implementations for American opti
 - **Spline EEB fitting** with B-splines (including optional \(\sqrt{\tau}\) basis term) and non-uniform time grids.
 - **Piecewise polynomial boundary in \(\sqrt{\tau}\)** for event-driven modeling (e.g., dividends).
 
+### Project layout
+- **american_options/** — Core library (Ju, Kim–Jang, GK, FDM, spline boundary fitting).
+- **scripts/** — Runnable scripts and demos.
+- **docs/papers/** — Reference PDFs.
+- **outputs/** — Generated plots (ignored by git).
+
 ### Key scripts
-- **compare_ju_fdm.py** — Run price comparisons across methods and generate EEB plots.
-- **boundary_estimator_piecewise.py** — Boundary fitting logic (B-splines + piecewise \(\sqrt{\tau}\) polynomials), residuals, Jacobians, and pricing from fitted boundaries.
-- **american_put_gk.py**, **gauss_kronrod.py** — GK boundary and pricing routines.
-- **ju_1998.py**, **ju_1998_piecewise.py** — Ju closed-form approximations.
-- **kim_jang_iter.py** — Iterative EEB solver.
-- **fd_pricer.py** — Finite-difference pricer for benchmarking.
-- **boundary_plotting.py** — Plotting utilities and EEB visualization.
-- **run_discrete_div_demo.py** — Demo for discrete dividend handling.
-- **verify_ju.py**, **verify_ju_piecewise.py** — Sanity checks against published results.
+- **scripts/compare_ju_fdm.py** — Run price comparisons across methods and generate EEB plots.
+- **scripts/boundary_plotting.py** — Plotting utilities and EEB visualization.
+- **scripts/run_discrete_div_demo.py** — Demo for discrete dividend handling.
+- **scripts/verify_ju.py**, **scripts/verify_ju_piecewise.py** — Sanity checks against published results.
 
 ### Data & outputs
 - **boundary_output_fdm.csv**, **boundary_output_gk.csv** — Precomputed boundaries.
@@ -38,36 +39,53 @@ Install dependencies:
 pip install numpy scipy pandas matplotlib
 ```
 
-## Quick start
+## How to use
 
-Run the main comparison (prices + boundary plots):
+Run commands from the repo root.
+
+1) Install dependencies:
 
 ```bash
-python compare_ju_fdm.py
+pip install numpy scipy pandas matplotlib
 ```
 
-This prints a comparison table across methods and writes plots to the repo root:
-- `eeb_comparison_2.png`
-- `call_eeb_comparison.png`
-
-## More examples
-
-Validate Ju approximation:
+2) Run the main comparison (prices + boundary plots):
 
 ```bash
-python verify_ju.py
-python verify_ju_piecewise.py
+python -m scripts.compare_ju_fdm
 ```
 
-Run the discrete dividend demo:
+Outputs are written to `outputs/`:
+- `outputs/eeb_comparison_2.png`
+- `outputs/call_eeb_comparison.png`
+
+3) Validate Ju approximation:
 
 ```bash
-python run_discrete_div_demo.py
+python -m scripts.verify_ju
+python -m scripts.verify_ju_piecewise
+```
+
+4) Run the discrete dividend demo:
+
+```bash
+python -m scripts.run_discrete_div_demo
+```
+
+## Quick start (legacy)
+
+If you prefer direct script execution, you can also run:
+
+```bash
+python scripts/compare_ju_fdm.py
+python scripts/verify_ju.py
+python scripts/verify_ju_piecewise.py
+python scripts/run_discrete_div_demo.py
 ```
 
 ## Notes on the spline EEB fit
 
-The spline fit uses a non-uniform time grid clustered near maturity and power-clustered knots in \(\tau = T - t\). A \(\sqrt{\tau}\) basis term can be included to capture the asymptotic behavior of the boundary near expiry. See `price_bspline_eeb()` and `boundary_bspline_eeb()` in compare_ju_fdm.py for the current configuration.
+The spline fit uses a non-uniform time grid clustered near maturity and power-clustered knots in \(\tau = T - t\). A \(\sqrt{\tau}\) basis term can be included to capture the asymptotic behavior of the boundary near expiry. See `price_bspline_eeb()` and `boundary_bspline_eeb()` in scripts/compare_ju_fdm.py for the current configuration.
 
 ## Citation
 

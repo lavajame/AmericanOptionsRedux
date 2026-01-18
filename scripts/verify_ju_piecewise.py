@@ -1,11 +1,18 @@
 
+import os
+import sys
+
 import numpy as np
 import pandas as pd
 
-from ju_1998 import Ju1998Pricing
-from fd_pricer import FiniteDifferenceAmerican
-from kim_jang_iter import KimJangIterative
-from gauss_kronrod import GKRule
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from american_options.ju_1998 import Ju1998Pricing
+from american_options.fd_pricer import FiniteDifferenceAmerican
+from american_options.kim_jang_iter import KimJangIterative
+from american_options.gauss_kronrod import GKRule
 
 FDM_M = 200
 FDM_N = 200

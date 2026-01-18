@@ -1,7 +1,15 @@
 
+import os
+import sys
+
 import numpy as np
 import pandas as pd
-from ju_1998 import pricing_function, Ju1998Pricing
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from american_options.ju_1998 import pricing_function, Ju1998Pricing
 
 def run_verification():
     results = []
