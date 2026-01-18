@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Office temp files
+~$*.xlsm
+
+# Generated outputs / benchmarks
+boundary_output.png
+boundary_output_*.csv
+eeb_comparison*.png
+call_eeb_comparison.png
+_fdm_bench_tmp.*
+eeb_via_polys.txt
+extract.txt
+full_10200717.txt
+ssrn-362.txt
+Ju_1999.txt
+260118 BoundaryWork.xlsm
