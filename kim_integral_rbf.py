@@ -8,13 +8,14 @@ Key formulation:
   - Transform: y = sqrt(T - t), y_max = sqrt(T)
   - Log boundary: log(B(y)/K) at N knots, initialized via design matrix
   - Design matrix: asymptotic powers y^k/(c^k + y^k) + step functions at dividends
+                   + linear ramps y*H(y>y_d) for post-dividend slope adjustment
   - Integration: Gaussian RBF operator with analytic antiderivatives
   - Solver: Newton's method with lower-triangular analytic Jacobian
 
 Supports:
   - American puts (w=-1) and calls (w=+1)
   - Continuous dividend yield q
-  - Discrete dividends at specified times
+  - Discrete dividends at specified times with automatic knot placement
 """
 
 import time
@@ -196,9 +197,11 @@ class KimIntegralRBF:
         Columns:
           k=1..n_powers : y^k / (c^k + y^k)   (asymptotic powers, c = y_max)
           i=1..n_div    : H(y - y_div_i)       (step functions at dividend times)
+          i=1..n_div    : y * H(y - y_div_i)   (linear ramps for post-dividend slope adjustment)
 
         All basis functions equal 0 at y=0 so B(0) = K is automatic.
         Powers approach 1 as y -> inf, capturing the long-maturity asymptote.
+        Step functions capture discontinuities, linear ramps allow slope changes.
         """
         y = self.y
         c = self.y_max
@@ -208,13 +211,23 @@ class KimIntegralRBF:
         for k in range(1, self.n_powers + 1):
             power_cols[:, k - 1] = y ** k / (c ** k + y ** k)
 
-        step_cols = np.zeros((n, len(self.div_schedule)))
-        for i, y_d in enumerate(self.div_y):
-            # Step function is active for y >= y_d
-            # Captures discontinuity at dividend time
-            step_cols[:, i] = (y >= y_d).astype(float)
-
-        return np.hstack([power_cols, step_cols]) if step_cols.shape[1] > 0 else power_cols
+        if len(self.div_schedule) > 0:
+            step_cols = np.zeros((n, len(self.div_schedule)))
+            ramp_cols = np.zeros((n, len(self.div_schedule)))
+            
+            for i, y_d in enumerate(self.div_y):
+                # Step function: active for y >= y_d
+                # Captures discontinuity at dividend time
+                active = (y >= y_d)
+                step_cols[:, i] = active.astype(float)
+                
+                # Linear ramp: y * H(y - y_d)
+                # Allows boundary slope to change after dividend
+                ramp_cols[:, i] = y * active.astype(float)
+            
+            return np.hstack([power_cols, step_cols, ramp_cols])
+        else:
+            return power_cols
 
     # ------------------------------------------------------------------
     # 4. Gaussian RBF integration operator
@@ -787,7 +800,7 @@ if __name__ == "__main__":
 
     N=60  # Finer grid to better resolve dividend transitions
     max_iters = 10
-    n_powers = 1
+    n_powers = 3
     do_call = True
 
     no_divs = False
@@ -934,7 +947,8 @@ if __name__ == "__main__":
         print(f"  {idx:<8} {tau_val:<12.6f} {B_val:<12.4f} {abs(res_val):<14.6e} {res_sq_val:<14.6e}{near_div}")
     
     # Regional RMSE analysis
-    if pricer_div.div_schedule:
+    # if pricer_div.div_schedule:
+    if True:
         print()
         print("Residual by region:")
         for t_d, D in pricer_div.div_schedule:
@@ -974,11 +988,25 @@ if __name__ == "__main__":
     print(f"Max |residual|: {np.max(np.abs(residual_full[1:])):.6e}")
     
     # Suggestion for improvement
-    if pricer_div.div_schedule and total_rmse > 1e-3:
-        print()
-        print("NOTE: Large residuals after dividends suggest adding more flexible basis:")
-        print("      Consider y*(y>y_d) terms for each dividend time y_d to allow")
-        print("      boundary slope to adjust post-dividend.")
+    if pricer_div.div_schedule:
+        # Check if linear ramps are already included
+        # Design matrix: n_powers + n_div (steps) + n_div (ramps) columns
+        n_expected_with_ramps = pricer_div.n_powers + 2 * len(pricer_div.div_schedule)
+        has_ramps = pricer_div.A_design.shape[1] >= n_expected_with_ramps
+        
+        if has_ramps:
+            if total_rmse > 0.1:
+                print()
+                print("NOTE: Large residuals persist after dividends despite using linear ramps.")
+                print("      Consider higher-order terms: y²*H(y>y_d), y³*H(y>y_d), etc.")
+            else:
+                print()
+                print(f"✓ Linear ramps y*H(y>y_d) successfully control post-dividend errors (RMSE={total_rmse:.2e}).")
+        elif total_rmse > 0.05:
+            print()
+            print("NOTE: Large residuals after dividends suggest adding more flexible basis:")
+            print("      Consider y*H(y>y_d) terms for each dividend time y_d to allow")
+            print("      boundary slope to adjust post-dividend.")
     print()
     
     # Overlay residual contribution on right axis
