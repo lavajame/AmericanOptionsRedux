@@ -785,14 +785,14 @@ if __name__ == "__main__":
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    N=20  # Finer grid to better resolve dividend transitions
-    max_iters = 5
-    n_powers = 3
+    N=60  # Finer grid to better resolve dividend transitions
+    max_iters = 10
+    n_powers = 1
     do_call = True
 
     no_divs = False
     div_times = [] if no_divs else [0.4]
-    div_amounts = [] if no_divs else [5.0]
+    div_amounts = [] if no_divs else [10.0]
     r=0.05
     q=0.05
     sigma=0.25
@@ -880,23 +880,125 @@ if __name__ == "__main__":
     print(f"  Max error  : {jac_test_div['max_error']:.6e}")
     print(f"  Mean error : {jac_test_div['mean_error']:.6e}")
 
-    # ---- Convergence plot ----
-    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+    # ---- Convergence plot with residual overlay ----
+    fig, ax1 = plt.subplots(1, 1, figsize=(12, 7))
 
+    # Plot boundary convergence on left axis
     for label, (B, rmse, eep) in res_div["history"].items():
         alpha = 0.8 if label==list(res_div["history"].keys())[-1] else 0.2
-        ax.plot(pricer_div.y ** 2, B, label=f"{label} RMSE={rmse:.2e} EEP={eep:.4f}", alpha=alpha)
+        ax1.plot(pricer_div.y ** 2, B, label=f"{label} RMSE={rmse:.2e} EEP={eep:.4f}", alpha=alpha)
 
-    # Mark dividend times
-    for t_d, D in pricer_div.div_schedule:
-        ax.axvline(pricer_div.T - t_d, color="red", ls="--", lw=1.2, alpha=0.7)
+    ax1.set_xlabel(r"$\tau = y^2$")
+    ax1.set_ylabel("B(tau)", color='C0')
+    ax1.tick_params(axis='y', labelcolor='C0')
+    ax1.set_ylim(95, 160)
+    ax1.invert_xaxis()
+    ax1.legend(loc='upper left', ncol=1, fontsize=9)
+    ax1.grid(alpha=0.3)
     
-    ax.set_title(f"American Call with Discrete Dividends - Boundary Convergence")
-    ax.set_xlabel(r"$\tau = y^2$")
-    ax.set_ylabel("B(tau)")
-    ax.invert_xaxis()
-    ax.legend(ncol=1, fontsize=9)
-    ax.grid(alpha=0.3)
+    # Compute final residual at each knot from the solved boundary
+    # Note: Must recompute because _last_residual_details may be stale after Jacobian test
+    B_final_boundary = res_div["boundary"]["B"].values
+    log_BK = np.log(B_final_boundary[1:] / pricer_div.K)
+    residual_final, _ = pricer_div.get_residual_and_jac(log_BK)
+    # Reconstruct full residual vector (including B0 which has residual=0 by construction)
+    residual_full = np.concatenate([[0.0], residual_final])
+    
+    # Also get details for plotting
+    details = pricer_div._last_residual_details
+    B_final = details['B']
+    
+    # Squared residual contribution (pointwise)
+    residual_sq = residual_full**2
+    
+    # Print diagnostic: where are the largest residuals?
+    print()
+    print("=" * 60)
+    print("Final Residual Analysis")
+    print("=" * 60)
+    top_n = 10
+    top_indices = np.argsort(residual_sq)[-top_n:][::-1]
+    print(f"Top {top_n} residual² contributions:")
+    print(f"  {'Index':<8} {'tau':<12} {'B(tau)':<12} {'|residual|':<14} {'residual²':<14}")
+    for idx in top_indices:
+        tau_val = details['tau'][idx]
+        B_val = B_final[idx]
+        res_val = residual_full[idx]
+        res_sq_val = residual_sq[idx]
+        # Check if near dividend
+        near_div = ""
+        for t_d, D in pricer_div.div_schedule:
+            if abs(tau_val - (pricer_div.T - t_d)) < 0.05:
+                near_div = f" ← near D={D} at t={t_d}"
+                break
+        print(f"  {idx:<8} {tau_val:<12.6f} {B_val:<12.4f} {abs(res_val):<14.6e} {res_sq_val:<14.6e}{near_div}")
+    
+    # Regional RMSE analysis
+    if pricer_div.div_schedule:
+        print()
+        print("Residual by region:")
+        for t_d, D in pricer_div.div_schedule:
+            tau_d = pricer_div.T - t_d
+            idx_div = np.argmin(np.abs(details['tau'] - tau_d))
+            
+            # Exclude B0 (index 0) from all analyses
+            mask_before = details['tau'][1:] < tau_d
+            mask_after = (details['tau'][1:] >= tau_d) & (details['tau'][1:] < 0.95)
+            
+            if np.any(mask_before):
+                rmse_before = np.sqrt(np.mean(residual_full[1:][mask_before]**2))
+            else:
+                rmse_before = 0
+            
+            if np.any(mask_after):
+                rmse_after = np.sqrt(np.mean(residual_full[1:][mask_after]**2))
+            else:
+                rmse_after = 0
+            
+            print(f"  Dividend D={D} at tau={tau_d:.4f}:")
+            print(f"    Before: RMSE = {rmse_before:.6e}")
+            print(f"    After:  RMSE = {rmse_after:.6e}")
+            if rmse_before > 0:
+                print(f"    Ratio:  {rmse_after/rmse_before:.1f}x worse after dividend")
+            
+            # Show jump across dividend (compare knots immediately before/after)
+            if 0 < idx_div < len(residual_full)-1:
+                res_before = abs(residual_full[idx_div])
+                res_after = abs(residual_full[idx_div+1])
+                if res_before > 1e-10:
+                    jump = res_after / res_before
+                    print(f"    |Residual| jump at knot {idx_div}→{idx_div+1}: {jump:.1f}x")
+    
+    total_rmse = np.sqrt(np.mean(residual_sq[1:]))  # Exclude B0
+    print(f"\nTotal RMSE: {total_rmse:.6e}")
+    print(f"Max |residual|: {np.max(np.abs(residual_full[1:])):.6e}")
+    
+    # Suggestion for improvement
+    if pricer_div.div_schedule and total_rmse > 1e-3:
+        print()
+        print("NOTE: Large residuals after dividends suggest adding more flexible basis:")
+        print("      Consider y*(y>y_d) terms for each dividend time y_d to allow")
+        print("      boundary slope to adjust post-dividend.")
+    print()
+    
+    # Overlay residual contribution on right axis
+    ax2 = ax1.twinx()
+    ax2.plot(pricer_div.y ** 2, residual_sq, 'o-', color='darkred', 
+             linewidth=2, markersize=4, alpha=0.7, label='Residual² (final)')
+    ax2.set_ylabel('Residual² contribution', color='darkred')
+    ax2.tick_params(axis='y', labelcolor='darkred')
+    ax2.set_yscale('log')
+    ax2.legend(loc='upper right', fontsize=9)
+    
+    # Mark dividend times on both axes
+    for t_d, D in pricer_div.div_schedule:
+        tau_d = pricer_div.T - t_d
+        ax1.axvline(tau_d, color="red", ls="--", lw=1.2, alpha=0.5, zorder=0)
+        # Annotate dividend
+        ax1.text(tau_d, ax1.get_ylim()[1]*0.98, f'D={D}', 
+                ha='right', va='top', fontsize=8, color='red', rotation=90)
+    
+    ax1.set_title(f"Boundary Convergence with Residual Diagnostic")
 
     plt.tight_layout()
     plt.savefig(f"kim_integral_rbf_convergence{'_no_divs' if no_divs else '_divs'}.png", dpi=150)
