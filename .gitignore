@@ -33,3 +33,32 @@ ssrn-362.txt
 Ju_1999.txt
 260118 BoundaryWork.xlsm
 outputs/
+
+# Debug and test scripts
+debug_*.py
+test_*.py
+check_*.py
+verify_*.py
+
+# Extra plots (keep only final convergence plots)
+*_sorted.png
+*_with_jumps.png
+fd_boundary_*.png
+dividend_boundary_*.png
+initial_boundary_*.png
+boundary_convergence.png
+
+# Temporary directories
+tmpclaude-*/
+
+# Text outputs
+output*.txt
+
+# Papers (large PDFs)
+docs/papers/*.pdf
+
+# Extra implementation files (keep only kim_integral_rbf.py)
+kim_iterative.py
+new_american.py
+american_options/
+scripts/
