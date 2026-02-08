@@ -619,22 +619,24 @@ class KimIntegralRBF:
         # Store boundary and EEP for each iteration in history
         # Recompute EEP for final iteration to store in history
         for iter_label, (B_iter, rmse) in history.items():
-            # Quick EEP calculation for this boundary
+            # Quick EEP calculation for this boundary at reference spot S0=K (ATM)
             f_vec_iter = np.zeros(self.N)
+            S0_ref = self.K  # Use dirty spot for consistency with price() method
+            S_ex_ref = self.K - self._pv_divs(self.T)
             for j in range(self.N):
                 tau_j = self.T - self.y[j] ** 2
                 if tau_j < 1e-12:
                     continue
                 pv_j = self._pv_divs(tau_j)
                 B_ex_j = max(B_iter[j] - pv_j, 1e-8)
-                # Use a reference S_ex for EEP calculation (e.g., at-the-money)
-                S_ex_ref = self.K - self._pv_divs(self.T)
                 if S_ex_ref > 1e-8:
                     vt = self.sigma * np.sqrt(tau_j)
+                    # d1 uses ex-dividend ratio for correct drift
                     d1 = (np.log(S_ex_ref / B_ex_j) + (self.r - self.q + 0.5 * self.sigma ** 2) * tau_j) / vt
                     d2 = d1 - vt
+                    # But integrand uses dirty spot for correct absolute value
                     f_vec_iter[j] = 2 * self.y[j] * self.w * (
-                        self.q * S_ex_ref * np.exp(-self.q * tau_j) * norm.cdf(self.w * d1)
+                        self.q * S0_ref * np.exp(-self.q * tau_j) * norm.cdf(self.w * d1)
                         - self.r * self.K * np.exp(-self.r * tau_j) * norm.cdf(self.w * d2)
                     )
             eep_iter = max(0, self.A_rbf[-1, :] @ f_vec_iter)
@@ -668,14 +670,17 @@ class KimIntegralRBF:
             self.solve_boundary(max_iters=max_iters, verbose_diagnostics=verbose_diagnostics)
 
         # European price at (S0, T)
+        # Use ex-dividend framework: S_ex = S0 - PV(all divs) is martingale
         pv_all = self._pv_divs(self.T)
-        S_ex = max(S0 - pv_all, 1e-8)  # Ex-dividend spot price
+        S_ex = max(S0 - pv_all, 1e-8)
         euro_price, _ = self._bs(S_ex, self.K, self.T)
 
-        # EEP at S0: integrate f(S_ex, B_ex(y_j), T - y_j^2, y_j) over j
-        # Work in ex-dividend space for consistency
-        # S_ex = S0 - PV(all divs) is constant in expectation (martingale)
-        # B_final[j] is dirty boundary, so B_ex[j] = B_final[j] - PV(divs from t_j to T)
+        # EEP at S0: integrate early exercise value over time
+        # CRITICAL: Use S0 (dirty spot) in integrand, not S_ex!
+        # The EEP measures value of early exercise at current spot S0.
+        # But we need to account for dividends when comparing to boundary:
+        # At time t_j, we compare S0 adjusted for divs paid by t_j to boundary B(t_j).
+        # This is equivalent to comparing S_ex to B_ex[j] = B[j] - PV(divs from t_j to T).
         y = self.y
         f_vec = np.zeros(self.N)
         for j in range(self.N):
@@ -683,16 +688,23 @@ class KimIntegralRBF:
             if tau_j < 1e-12:
                 continue
             
-            # Convert dirty boundary to ex-dividend boundary
+            # At time t_j, dividends between 0 and t_j have been paid
+            # Expected dirty spot at t_j given S0 now:
+            # But we work in ex-dividend space for martingale property
+            # So we use S_ex and B_ex[j] for the ratio, but S0 for the absolute value
             pv_j = self._pv_divs(tau_j)  # PV of divs from t_j to T
             B_ex_j = max(B_final[j] - pv_j, 1e-8)
             
+            # Compute d1 using ex-dividend prices (for correct drift)
             vt = self.sigma * np.sqrt(tau_j)
             d1 = (np.log(S_ex / B_ex_j)
                   + (self.r - self.q + 0.5 * self.sigma ** 2) * tau_j) / vt
             d2 = d1 - vt
+            
+            # But use S0 (dirty) in the integrand for correct absolute value!
+            # This ensures EEP increases with dividends as expected economically
             f_vec[j] = 2 * y[j] * self.w * (
-                self.q * S_ex * np.exp(-self.q * tau_j) * norm.cdf(self.w * d1)
+                self.q * S0 * np.exp(-self.q * tau_j) * norm.cdf(self.w * d1)
                 - self.r * self.K * np.exp(-self.r * tau_j) * norm.cdf(self.w * d2)
             )
         eep_val = max(0, self.A_rbf[-1, :] @ f_vec)
