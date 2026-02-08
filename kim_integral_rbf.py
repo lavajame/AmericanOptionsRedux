@@ -343,15 +343,19 @@ class KimIntegralRBF:
                     return self.w * (S_star - self.K) - euro_price
 
                 # Solve for S* using bisection
+                # Bounds must ensure S_adj = S* - pv_divs > 0
                 if self.w == +1:  # call
-                    lo, hi = self.K * 0.5, self.K * 3.0
+                    lo = max(self.K * 0.5, pv_divs + 1e-2)
+                    hi = self.K * 3.0
                 else:  # put
-                    lo, hi = 1e-4, self.K * 1.5
+                    lo = max(1e-4, pv_divs + 1e-2)
+                    hi = self.K * 1.5
 
                 try:
                     S_star_d = self._bisection(objective, lo, hi)
-                except (ValueError, RuntimeError):
+                except (ValueError, RuntimeError) as e:
                     # If bisection fails, skip this adjustment
+                    print(f"  Warning: Failed to solve for S* at t={t_d:.3f}: {e}")
                     continue
                 
                 print(f"Dividend at t={t_d:.3f}: S*={S_star_d:.4f}, PV(divs)={pv_divs:.4f}")
@@ -590,20 +594,52 @@ class KimIntegralRBF:
                 B_updated = np.concatenate([[self.B0], self.K * np.exp(H)])
                 log_BK = np.log(B_updated / self.K)
                 
-                # Least-squares fit: log(B/K) = A @ c
-                c_fit = np.linalg.lstsq(self.A_design, log_BK, rcond=None)[0]
+                # Ridge regression with L2 penalty: log(B/K) = A @ c + penalty
+                # Solves: (A^T A + lambda*I) c = A^T log_BK
+                ridge_lambda = 1e-3  # Small L2 penalty to avoid noise chasing
+                ATA = self.A_design.T @ self.A_design
+                ATb = self.A_design.T @ log_BK
+                c_fit = np.linalg.solve(ATA + ridge_lambda * np.eye(ATA.shape[0]), ATb)
                 log_BK_smooth = self.A_design @ c_fit
                 
                 # Update H with smoothed boundary
                 H = log_BK_smooth[1:]
 
-            # Clip to reasonable range
-            if self.w == -1:                             # put: B <= K
-                H = np.clip(H, np.log(0.01), np.log(2.0))
-            else:                                        # call: B >= K
-                H = np.clip(H, np.log(0.5), np.log(10.0))
+            # Clip to economically sensible ranges to avoid irrational early exercise
+            # For calls: B >= K (early ex only if in-the-money)
+            # For puts: B <= K (early ex only if in-the-money)
+            # Also limit extreme values that would give zero EEP contribution
+            if self.w == -1:  # put: 0.5*K <= B <= K
+                H = np.clip(H, np.log(0.5), np.log(1.0))
+            else:  # call: K <= B <= 3*K
+                H = np.clip(H, np.log(1.0), np.log(3.0))
 
         B_final = np.concatenate([[self.B0], self.K * np.exp(H)])
+        
+        # Store boundary and EEP for each iteration in history
+        # Recompute EEP for final iteration to store in history
+        for iter_label, (B_iter, rmse) in history.items():
+            # Quick EEP calculation for this boundary
+            f_vec_iter = np.zeros(self.N)
+            for j in range(self.N):
+                tau_j = self.T - self.y[j] ** 2
+                if tau_j < 1e-12:
+                    continue
+                pv_j = self._pv_divs(tau_j)
+                B_ex_j = max(B_iter[j] - pv_j, 1e-8)
+                # Use a reference S_ex for EEP calculation (e.g., at-the-money)
+                S_ex_ref = self.K - self._pv_divs(self.T)
+                if S_ex_ref > 1e-8:
+                    vt = self.sigma * np.sqrt(tau_j)
+                    d1 = (np.log(S_ex_ref / B_ex_j) + (self.r - self.q + 0.5 * self.sigma ** 2) * tau_j) / vt
+                    d2 = d1 - vt
+                    f_vec_iter[j] = 2 * self.y[j] * self.w * (
+                        self.q * S_ex_ref * np.exp(-self.q * tau_j) * norm.cdf(self.w * d1)
+                        - self.r * self.K * np.exp(-self.r * tau_j) * norm.cdf(self.w * d2)
+                    )
+            eep_iter = max(0, self.A_rbf[-1, :] @ f_vec_iter)
+            history[iter_label] = (B_iter, rmse, eep_iter)
+        
         return B_final, history, initial_residual_norm, iteration_diagnostics
 
     # ------------------------------------------------------------------
@@ -632,23 +668,31 @@ class KimIntegralRBF:
             self.solve_boundary(max_iters=max_iters, verbose_diagnostics=verbose_diagnostics)
 
         # European price at (S0, T)
-        pv = self._pv_divs(self.T)
-        S_adj = max(S0 - pv, 1e-8)
-        euro_price, _ = self._bs(S_adj, self.K, self.T)
+        pv_all = self._pv_divs(self.T)
+        S_ex = max(S0 - pv_all, 1e-8)  # Ex-dividend spot price
+        euro_price, _ = self._bs(S_ex, self.K, self.T)
 
-        # EEP at S0: integrate f(S0, B(y_j), T - y_j^2, y_j) over j
+        # EEP at S0: integrate f(S_ex, B_ex(y_j), T - y_j^2, y_j) over j
+        # Work in ex-dividend space for consistency
+        # S_ex = S0 - PV(all divs) is constant in expectation (martingale)
+        # B_final[j] is dirty boundary, so B_ex[j] = B_final[j] - PV(divs from t_j to T)
         y = self.y
         f_vec = np.zeros(self.N)
         for j in range(self.N):
             tau_j = self.T - y[j] ** 2
             if tau_j < 1e-12:
                 continue
+            
+            # Convert dirty boundary to ex-dividend boundary
+            pv_j = self._pv_divs(tau_j)  # PV of divs from t_j to T
+            B_ex_j = max(B_final[j] - pv_j, 1e-8)
+            
             vt = self.sigma * np.sqrt(tau_j)
-            d1 = (np.log(S_adj / B_final[j])
+            d1 = (np.log(S_ex / B_ex_j)
                   + (self.r - self.q + 0.5 * self.sigma ** 2) * tau_j) / vt
             d2 = d1 - vt
             f_vec[j] = 2 * y[j] * self.w * (
-                self.q * S_adj * np.exp(-self.q * tau_j) * norm.cdf(self.w * d1)
+                self.q * S_ex * np.exp(-self.q * tau_j) * norm.cdf(self.w * d1)
                 - self.r * self.K * np.exp(-self.r * tau_j) * norm.cdf(self.w * d2)
             )
         eep_val = max(0, self.A_rbf[-1, :] @ f_vec)
@@ -729,85 +773,91 @@ if __name__ == "__main__":
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # ---- Focus on discrete dividend call case ----
-    print("=" * 60)
-    print("American Call  (S=100, K=100, T=1, r=2%, q=2.0%, sigma=10%)")
-    print("  Discrete dividends: D=2.0 at t=0.25, D=2.0 at t=0.75")
-    print("=" * 60)
-
-    N=60  # Finer grid to better resolve dividend transitions
-    max_iters = 10
-    n_powers = 2
+    N=20  # Finer grid to better resolve dividend transitions
+    max_iters = 5
+    n_powers = 3
     do_call = True
 
-    div_times = [0.25, 0.75]
-    div_amounts = [2.0, 2.0]
+    no_divs = False
+    div_times = [] if no_divs else [0.4]
+    div_amounts = [] if no_divs else [5.0]
+    r=0.05
+    q=0.05
+    sigma=0.25
 
+    # ---- Focus on discrete dividend call case ----
+    print("=" * 60)
+    print(f"American Call  (S=100, K=100, T=1, r={r*100}%, q={q*100}%, sigma={sigma*100}%)")
+    print(f"Discrete dividends: {', '.join([f'{d} at t={t:.2f}' for t, d in zip(div_times, div_amounts)])}")
+    print("=" * 60)
+
+   
     pricer_div = KimIntegralRBF(
-        K=100, T=1.0, r=0.02, q=0.02, sigma=0.10, w=+1 if do_call else -1, N=N, n_powers=n_powers,
+        K=100, T=1.0, r=r, q=q, sigma=sigma, w=+1 if do_call else -1, N=N, n_powers=n_powers,
         div_times=div_times, div_amounts=div_amounts)
-    res_div = pricer_div.price(S0=100, max_iters=max_iters, verbose_diagnostics=True)
+    res_div = pricer_div.price(S0=100, max_iters=max_iters, verbose_diagnostics=False)
     print(f"  Euro : {res_div['euro']:.8f}")
     print(f"  EEP  : {res_div['eep']:.8f}")
     print(f"  Amer : {res_div['amer']:.8f}")
     print(f"  Init Residual: {res_div['initial_residual_norm']:.6e}")
     print(f"  Time : {res_div['runtime']:.4f}s")
 
-    # ---- Residual diagnostics during iterations ----
-    print()
-    print("=" * 60)
-    print("Residual & Jacobian Profile During Iterations")
-    print("=" * 60)
-    
-    if 'iteration_diagnostics' in res_div and res_div['iteration_diagnostics']:
-        for diag in res_div['iteration_diagnostics']:
-            it = diag['iteration']
-            print(f"\n{'='*80}")
-            print(f"ITERATION {it} (RMSE = {diag['rmse']:.6e})")
-            print(f"{'='*80}")
-            
-            for div_info in diag['dividends']:
-                div_num = div_info['div_num']
-                t_d = div_info['t_d']
-                y_d = div_info['y_d']
-                idx_B = div_info['idx_B']
-                start_B = div_info['start_B']
+    if False:
+        # ---- Residual diagnostics during iterations ----
+        print()
+        print("=" * 60)
+        print("Residual & Jacobian Profile During Iterations")
+        print("=" * 60)
+        
+        if 'iteration_diagnostics' in res_div and res_div['iteration_diagnostics']:
+            for diag in res_div['iteration_diagnostics']:
+                it = diag['iteration']
+                print(f"\n{'='*80}")
+                print(f"ITERATION {it} (RMSE = {diag['rmse']:.6e})")
+                print(f"{'='*80}")
                 
-                print(f"\nDividend {div_num} at t={t_d:.3f} (y={y_d:.6f}), B-index={idx_B}")
-                print(f"Max |residual| in window: {div_info['max_abs_residual']:.6e}")
-                print(f"\n  {'B-Idx':<6} {'y':<14} {'B(y)':<16} {'Residual':<16} {'Jac[i,i]':<16}")
-                print("  " + "-" * 78)
-                
-                y_vals = div_info['y_values']
-                B_vals = div_info['boundary']
-                res_vals = div_info['residuals']
-                jac_vals = div_info['jac_diagonal']
-                
-                # Key insight: res_vals is a window extracted from the full residual array
-                # B_vals[k] corresponds to res_vals[k] via shifted indexing
-                for k in range(len(y_vals)):
-                    B_idx = start_B + k
-                    marker = " <-- div" if (B_idx == idx_B or 
-                        (B_idx > 0 and pricer_div.y[B_idx-1] < y_d <= pricer_div.y[B_idx])) else ""
+                for div_info in diag['dividends']:
+                    div_num = div_info['div_num']
+                    t_d = div_info['t_d']
+                    y_d = div_info['y_d']
+                    idx_B = div_info['idx_B']
+                    start_B = div_info['start_B']
                     
-                    window_idx = B_idx - start_B - 1
+                    print(f"\nDividend {div_num} at t={t_d:.3f} (y={y_d:.6f}), B-index={idx_B}")
+                    print(f"Max |residual| in window: {div_info['max_abs_residual']:.6e}")
+                    print(f"\n  {'B-Idx':<6} {'y':<14} {'B(y)':<16} {'Residual':<16} {'Jac[i,i]':<16}")
+                    print("  " + "-" * 78)
                     
-                    res_str = f"{res_vals[window_idx]:.8e}" if 0 <= window_idx < len(res_vals) else "N/A"
-                    jac_str = f"{jac_vals[window_idx]:.8e}" if 0 <= window_idx < len(jac_vals) else "N/A"
+                    y_vals = div_info['y_values']
+                    B_vals = div_info['boundary']
+                    res_vals = div_info['residuals']
+                    jac_vals = div_info['jac_diagonal']
                     
-                    # Add detailed residual breakdown for problematic knots
-                    if hasattr(pricer_div, '_last_residual_details') and abs(y_vals[k] - y_d) < 0.01:
-                        details = pricer_div._last_residual_details
-                        euro = details['euro_p'][B_idx] if B_idx < len(details['euro_p']) else 0
-                        eep = details['eep'][B_idx] if B_idx < len(details['eep']) else 0
-                        pv_div = details['pv_divs'][B_idx] if B_idx < len(details['pv_divs']) else 0
-                        intrinsic = pricer_div.w * (B_vals[k] - pricer_div.K)
-                        detail_str = f" [Euro={euro:.4f}, EEP={eep:.4f}, PV(D)={pv_div:.4f}, Int={intrinsic:.4f}]"
-                    else:
-                        detail_str = ""
-                    
-                    print(f"  {B_idx:<6} {y_vals[k]:<14.8f} {B_vals[k]:<16.8f} "
-                          f"{res_str:<16} {jac_str:<16}{marker}{detail_str}")
+                    # Key insight: res_vals is a window extracted from the full residual array
+                    # B_vals[k] corresponds to res_vals[k] via shifted indexing
+                    for k in range(len(y_vals)):
+                        B_idx = start_B + k
+                        marker = " <-- div" if (B_idx == idx_B or 
+                            (B_idx > 0 and pricer_div.y[B_idx-1] < y_d <= pricer_div.y[B_idx])) else ""
+                        
+                        window_idx = B_idx - start_B - 1
+                        
+                        res_str = f"{res_vals[window_idx]:.8e}" if 0 <= window_idx < len(res_vals) else "N/A"
+                        jac_str = f"{jac_vals[window_idx]:.8e}" if 0 <= window_idx < len(jac_vals) else "N/A"
+                        
+                        # Add detailed residual breakdown for problematic knots
+                        if hasattr(pricer_div, '_last_residual_details') and abs(y_vals[k] - y_d) < 0.01:
+                            details = pricer_div._last_residual_details
+                            euro = details['euro_p'][B_idx] if B_idx < len(details['euro_p']) else 0
+                            eep = details['eep'][B_idx] if B_idx < len(details['eep']) else 0
+                            pv_div = details['pv_divs'][B_idx] if B_idx < len(details['pv_divs']) else 0
+                            intrinsic = pricer_div.w * (B_vals[k] - pricer_div.K)
+                            detail_str = f" [Euro={euro:.4f}, EEP={eep:.4f}, PV(D)={pv_div:.4f}, Int={intrinsic:.4f}]"
+                        else:
+                            detail_str = ""
+                        
+                        print(f"  {B_idx:<6} {y_vals[k]:<14.8f} {B_vals[k]:<16.8f} "
+                            f"{res_str:<16} {jac_str:<16}{marker}{detail_str}")
 
     # ---- Jacobian test ----
     print()
@@ -819,11 +869,11 @@ if __name__ == "__main__":
     print(f"  Mean error : {jac_test_div['mean_error']:.6e}")
 
     # ---- Convergence plot ----
-    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
 
-    for label, (B, rmse) in res_div["history"].items():
+    for label, (B, rmse, eep) in res_div["history"].items():
         alpha = 0.8 if label==list(res_div["history"].keys())[-1] else 0.2
-        ax.plot(pricer_div.y ** 2, B, label=f"{label} RMSE={rmse:.2e}", alpha=alpha)
+        ax.plot(pricer_div.y ** 2, B, label=f"{label} RMSE={rmse:.2e} EEP={eep:.4f}", alpha=alpha)
 
     # Mark dividend times
     for t_d, D in pricer_div.div_schedule:
@@ -837,5 +887,5 @@ if __name__ == "__main__":
     ax.grid(alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig("kim_integral_rbf_convergence.png", dpi=150)
-    print("\nSaved kim_integral_rbf_convergence.png")
+    plt.savefig(f"kim_integral_rbf_convergence{'_no_divs' if no_divs else '_divs'}.png", dpi=150)
+    print(f"\nSaved kim_integral_rbf_convergence{'_no_divs' if no_divs else ''}.png")
