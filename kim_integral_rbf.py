@@ -7,8 +7,11 @@ to solve for the early exercise boundary simultaneously at all knots.
 Key formulation:
   - Transform: y = sqrt(T - t), y_max = sqrt(T)
   - Log boundary: log(B(y)/K) at N knots, initialized via design matrix
-  - Design matrix: asymptotic powers y^k/(c^k + y^k) + step functions at dividends
-                   + linear ramps y*H(y>y_d) for post-dividend slope adjustment
+  - Design matrix: 
+    * Global asymptotic powers: y^k/(c^k + y^k)
+    * Step functions at dividends: H(y - y_d)
+    * Linear ramps for post-dividend slope: y*H(y - y_d)
+    * Localized powers at each dividend: (y - y_d)_+^k/(c^k + (y - y_d)_+^k)
   - Integration: Gaussian RBF operator with analytic antiderivatives
   - Solver: Newton's method with lower-triangular analytic Jacobian
 
@@ -198,15 +201,19 @@ class KimIntegralRBF:
           k=1..n_powers : y^k / (c^k + y^k)   (asymptotic powers, c = y_max)
           i=1..n_div    : H(y - y_div_i)       (step functions at dividend times)
           i=1..n_div    : y * H(y - y_div_i)   (linear ramps for post-dividend slope adjustment)
+          i=1..n_div, k=1..n_powers : (y - y_div_i)_+^k / (c^k + (y - y_div_i)_+^k)
+                                      (localized power basis starting at each dividend)
 
         All basis functions equal 0 at y=0 so B(0) = K is automatic.
         Powers approach 1 as y -> inf, capturing the long-maturity asymptote.
         Step functions capture discontinuities, linear ramps allow slope changes.
+        Localized powers provide flexible post-dividend shape control.
         """
         y = self.y
         c = self.y_max
         n = len(y)
 
+        # Global power terms
         power_cols = np.zeros((n, self.n_powers))
         for k in range(1, self.n_powers + 1):
             power_cols[:, k - 1] = y ** k / (c ** k + y ** k)
@@ -214,6 +221,8 @@ class KimIntegralRBF:
         if len(self.div_schedule) > 0:
             step_cols = np.zeros((n, len(self.div_schedule)))
             ramp_cols = np.zeros((n, len(self.div_schedule)))
+            # Localized power terms: n_div * n_powers columns
+            local_power_cols = np.zeros((n, len(self.div_schedule) * self.n_powers))
             
             for i, y_d in enumerate(self.div_y):
                 # Step function: active for y >= y_d
@@ -224,8 +233,15 @@ class KimIntegralRBF:
                 # Linear ramp: y * H(y - y_d)
                 # Allows boundary slope to change after dividend
                 ramp_cols[:, i] = y * active.astype(float)
+                
+                # Localized power terms: (y - y_d)_+^k / (c^k + (y - y_d)_+^k)
+                # Start from zero at y_d, provide flexible shape control post-dividend
+                y_shifted = np.maximum(0, y - y_d)
+                for k in range(1, self.n_powers + 1):
+                    col_idx = i * self.n_powers + (k - 1)
+                    local_power_cols[:, col_idx] = y_shifted ** k / (c ** k + y_shifted ** k)
             
-            return np.hstack([power_cols, step_cols, ramp_cols])
+            return np.hstack([power_cols, step_cols, ramp_cols, local_power_cols])
         else:
             return power_cols
 
@@ -989,12 +1005,28 @@ if __name__ == "__main__":
     
     # Suggestion for improvement
     if pricer_div.div_schedule:
-        # Check if linear ramps are already included
-        # Design matrix: n_powers + n_div (steps) + n_div (ramps) columns
-        n_expected_with_ramps = pricer_div.n_powers + 2 * len(pricer_div.div_schedule)
+        # Check what basis functions are included
+        # Design matrix columns:
+        #   n_powers (global)
+        #   + n_div (steps)
+        #   + n_div (ramps)
+        #   + n_div * n_powers (localized powers)
+        n_div = len(pricer_div.div_schedule)
+        n_expected_with_ramps = pricer_div.n_powers + 2 * n_div
+        n_expected_with_local_powers = pricer_div.n_powers + 2 * n_div + n_div * pricer_div.n_powers
+        
+        has_local_powers = pricer_div.A_design.shape[1] >= n_expected_with_local_powers
         has_ramps = pricer_div.A_design.shape[1] >= n_expected_with_ramps
         
-        if has_ramps:
+        if has_local_powers:
+            if total_rmse > 0.1:
+                print()
+                print("NOTE: Large residuals persist despite full basis (powers + steps + ramps + local powers).")
+                print("      May need finer grid (increase N) or more power terms (increase n_powers).")
+            else:
+                print()
+                print(f"✓ Full basis with localized powers successfully controls errors (RMSE={total_rmse:.2e}).")
+        elif has_ramps:
             if total_rmse > 0.1:
                 print()
                 print("NOTE: Large residuals persist after dividends despite using linear ramps.")
