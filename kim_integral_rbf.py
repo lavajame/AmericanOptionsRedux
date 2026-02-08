@@ -309,7 +309,7 @@ class KimIntegralRBF:
 
         If discrete dividends are present, adjusts the boundary at each
         dividend time t_d by solving w*(S*-K) = Euro(S*-sumDivs, K, tau_d)
-        and scaling the boundary after t_d by S* / B(y_d - eps).
+        and smoothly transitioning the boundary to S* at y_d.
         Dividends are processed from closest to expiry (largest t_d) backwards,
         accumulating their effects as we move back in time.
         """
@@ -356,17 +356,23 @@ class KimIntegralRBF:
                 
                 print(f"Dividend at t={t_d:.3f}: S*={S_star_d:.4f}, PV(divs)={pv_divs:.4f}")
 
-                # Find B just before the dividend (y slightly less than y_d)
-                # B_before already includes effects of all later dividends (processed earlier)
-                idx_before = np.searchsorted(self.y, y_d) - 1
-                if idx_before >= 0 and idx_before < len(B):
-                    B_before = B[idx_before]
-                    if B_before > 1e-8:  # avoid division by zero
-                        # Compute jump ratio
-                        ratio = S_star_d / B_before
-
-                        # Scale all boundary values at y >= y_d by this ratio
-                        # (i.e., from this dividend forward to maturity)
+                # Compute scaling factor to adjust boundary at and after this dividend
+                # Interpolate to find B at exactly y_d
+                idx_d = np.searchsorted(self.y, y_d)
+                
+                if idx_d > 0 and idx_d < len(self.y):
+                    # Linearly interpolate B at y_d
+                    if self.y[idx_d] == y_d:
+                        B_at_yd = B[idx_d]
+                    else:
+                        y_left, y_right = self.y[idx_d - 1], self.y[idx_d]
+                        B_left, B_right = B[idx_d - 1], B[idx_d]
+                        frac = (y_d - y_left) / max(y_right - y_left, 1e-12)
+                        B_at_yd = B_left + frac * (B_right - B_left)
+                    
+                    if B_at_yd > 1e-8:
+                        # Apply multiplicative scaling to preserve curve shape
+                        ratio = S_star_d / B_at_yd
                         mask = self.y >= y_d
                         B[mask] *= ratio
 
@@ -449,6 +455,15 @@ class KimIntegralRBF:
         # ---- 5. Smooth pasting residual ----
         res = (self.w * (B - self.K) - (euro_p + eep))[1:]
 
+        # Store detailed info for diagnostics
+        self._last_residual_details = {
+            'B': B.copy(),
+            'euro_p': euro_p.copy(),
+            'eep': eep.copy(),
+            'tau': y**2,
+            'pv_divs': np.array([self._pv_divs(tau) for tau in y**2])
+        }
+
         # ---- 6. Jacobian (lower triangular) ----
         dd1_dS = np.where(valid, 1.0 / (B[:, None] * vt), 0.0)
         dd1_dB = np.where(valid, -1.0 / (B[None, :] * vt), 0.0)
@@ -487,7 +502,7 @@ class KimIntegralRBF:
     # ------------------------------------------------------------------
     # 7. Newton solver
     # ------------------------------------------------------------------
-    def solve_boundary(self, max_iters=5, tol=1e-9):
+    def solve_boundary(self, max_iters=5, tol=1e-9, verbose_diagnostics=False):
         """
         Solve for the early exercise boundary via Newton's method.
 
@@ -499,6 +514,8 @@ class KimIntegralRBF:
             Iteration snapshots {label: (B_array, rmse)}.
         initial_residual_norm : float
             Initial residual norm (before Newton iterations).
+        iteration_diagnostics : list of dicts
+            Detailed residual/Jacobian info around dividend times per iteration.
         """
         log_BK = self._initial_log_boundary()
         H = log_BK[1:]  # unknowns (knot 0 is fixed)
@@ -508,14 +525,53 @@ class KimIntegralRBF:
         initial_residual_norm = np.linalg.norm(res_init)
 
         history = {}
+        iteration_diagnostics = []
+        
         for it in range(max_iters):
             res, jac = self.get_residual_and_jac(H)
             res_rmse = np.sqrt(np.sum(res ** 2))
             
-            history[f"Iter{it:2d}"] = (
-                np.concatenate([[self.B0], self.K * np.exp(H)]),
-                res_rmse
-            )
+            B = np.concatenate([[self.B0], self.K * np.exp(H)])
+            history[f"Iter{it:2d}"] = (B.copy(), res_rmse)
+
+            # Collect detailed diagnostics around dividend times
+            if verbose_diagnostics and self.div_schedule:
+                diag_info = {'iteration': it, 'rmse': res_rmse, 'dividends': []}
+                
+                for i, (t_d, D) in enumerate(self.div_schedule):
+                    y_d = np.sqrt(self.T - t_d)
+                    idx = np.searchsorted(self.y, y_d)
+                    
+                    # Get residuals and Jacobian diagonal around this dividend
+                    # Note: res, jac are for H (excluding first knot), indexed 0 to N-2
+                    # Boundary B is indexed 0 to N-1
+                    start_B = max(0, idx - 3)
+                    end_B = min(len(B), idx + 4)
+                    
+                    # Map to H/res/jac indices (shifted by -1)
+                    start_H = max(0, start_B - 1)
+                    end_H = min(len(res), end_B - 1)
+                    
+                    res_window = res[start_H:end_H]
+                    jac_diag_window = np.diag(jac)[start_H:end_H]
+                    B_window = B[start_B:end_B]
+                    y_window = self.y[start_B:end_B]
+                    
+                    div_diag = {
+                        'div_num': i + 1,
+                        't_d': t_d,
+                        'y_d': y_d,
+                        'idx_B': idx,
+                        'start_B': start_B,
+                        'residuals': res_window.copy(),
+                        'jac_diagonal': jac_diag_window.copy(),
+                        'boundary': B_window.copy(),
+                        'y_values': y_window.copy(),
+                        'max_abs_residual': np.max(np.abs(res_window)) if len(res_window) > 0 else 0.0
+                    }
+                    diag_info['dividends'].append(div_diag)
+                
+                iteration_diagnostics.append(diag_info)
 
             res_norm = np.linalg.norm(res)
             if res_norm < tol:
@@ -529,6 +585,18 @@ class KimIntegralRBF:
 
             H -= delta
 
+            # Re-fit boundary to design matrix to remove kinks
+            if self.div_schedule:
+                B_updated = np.concatenate([[self.B0], self.K * np.exp(H)])
+                log_BK = np.log(B_updated / self.K)
+                
+                # Least-squares fit: log(B/K) = A @ c
+                c_fit = np.linalg.lstsq(self.A_design, log_BK, rcond=None)[0]
+                log_BK_smooth = self.A_design @ c_fit
+                
+                # Update H with smoothed boundary
+                H = log_BK_smooth[1:]
+
             # Clip to reasonable range
             if self.w == -1:                             # put: B <= K
                 H = np.clip(H, np.log(0.01), np.log(2.0))
@@ -536,12 +604,12 @@ class KimIntegralRBF:
                 H = np.clip(H, np.log(0.5), np.log(10.0))
 
         B_final = np.concatenate([[self.B0], self.K * np.exp(H)])
-        return B_final, history, initial_residual_norm
+        return B_final, history, initial_residual_norm, iteration_diagnostics
 
     # ------------------------------------------------------------------
     # Pricing
     # ------------------------------------------------------------------
-    def price(self, S0, max_iters=10):
+    def price(self, S0, max_iters=10, verbose_diagnostics=False):
         """
         Price an American option at spot S0.
 
@@ -555,11 +623,13 @@ class KimIntegralRBF:
             history : Newton iteration snapshots
             boundary : DataFrame with y, tau, B columns
             initial_residual_norm : initial residual norm before Newton
+            iteration_diagnostics : detailed residual/Jacobian tracking (if verbose_diagnostics=True)
         """
         import pandas as pd
 
         t0 = time.perf_counter()
-        B_final, history, initial_residual_norm = self.solve_boundary(max_iters=max_iters)
+        B_final, history, initial_residual_norm, iteration_diagnostics = \
+            self.solve_boundary(max_iters=max_iters, verbose_diagnostics=verbose_diagnostics)
 
         # European price at (S0, T)
         pv = self._pv_divs(self.T)
@@ -594,6 +664,7 @@ class KimIntegralRBF:
             "boundary": pd.DataFrame(
                 {"y": y, "tau": y ** 2, "B": B_final}),
             "initial_residual_norm": initial_residual_norm,
+            "iteration_diagnostics": iteration_diagnostics,
         }
 
 
@@ -658,166 +729,111 @@ if __name__ == "__main__":
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    # ---- Test 1: American Put (no discrete dividends) ----
+    # ---- Focus on discrete dividend call case ----
     print("=" * 60)
-    print("American Put  (S=100, K=100, T=1, r=5%, q=5%, sigma=25%)")
-    print("=" * 60)
-
-    N=20
-    max_iters = 4
-    n_powers = 3
-
-    pricer_put = KimIntegralRBF(
-        K=100, T=1.0, r=0.05, q=0.05, sigma=0.25, w=-1, N=N, n_powers=n_powers)
-    res_put = pricer_put.price(S0=100, max_iters=max_iters)
-    print(f"  Euro : {res_put['euro']:.8f}")
-    print(f"  EEP  : {res_put['eep']:.8f}")
-    print(f"  Amer : {res_put['amer']:.8f}")
-    print(f"  Init Residual: {res_put['initial_residual_norm']:.6e}")
-    print(f"  Time : {res_put['runtime']:.4f}s")
-
-    # ---- Test 2: American Call (continuous dividend) ----
-    print()
-    print("=" * 60)
-    print("American Call (S=100, K=100, T=1, r=5%, q=5%, sigma=25%)")
-    print("=" * 60)
-    pricer_call = KimIntegralRBF(
-        K=100, T=1.0, r=0.05, q=0.05, sigma=0.25, w=+1, N=N, n_powers=n_powers)
-    res_call = pricer_call.price(S0=100, max_iters=max_iters)
-    print(f"  Euro : {res_call['euro']:.8f}")
-    print(f"  EEP  : {res_call['eep']:.8f}")
-    print(f"  Amer : {res_call['amer']:.8f}")
-    print(f"  Init Residual: {res_call['initial_residual_norm']:.6e}")
-    print(f"  Time : {res_call['runtime']:.4f}s")
-
-    # ---- Test 3: American Put with discrete dividends ----
-    do_call = False
-    print()
-    print("=" * 60)
-    print(f"American {'Call' if do_call else 'Put'}  (S=100, K=100, T=1, r=2%, q=2.0%, sigma=10%)")
+    print("American Call  (S=100, K=100, T=1, r=2%, q=2.0%, sigma=10%)")
     print("  Discrete dividends: D=2.0 at t=0.25, D=2.0 at t=0.75")
     print("=" * 60)
+
+    N=60  # Finer grid to better resolve dividend transitions
+    max_iters = 10
+    n_powers = 2
+    do_call = True
+
+    div_times = [0.25, 0.75]
+    div_amounts = [2.0, 2.0]
+
     pricer_div = KimIntegralRBF(
         K=100, T=1.0, r=0.02, q=0.02, sigma=0.10, w=+1 if do_call else -1, N=N, n_powers=n_powers,
-        div_times=[0.25, 0.75], div_amounts=[2.0, 2.0])
-    res_div = pricer_div.price(S0=100, max_iters=max_iters)
+        div_times=div_times, div_amounts=div_amounts)
+    res_div = pricer_div.price(S0=100, max_iters=max_iters, verbose_diagnostics=True)
     print(f"  Euro : {res_div['euro']:.8f}")
     print(f"  EEP  : {res_div['eep']:.8f}")
     print(f"  Amer : {res_div['amer']:.8f}")
     print(f"  Init Residual: {res_div['initial_residual_norm']:.6e}")
     print(f"  Time : {res_div['runtime']:.4f}s")
 
-    # ---- Test 4: Jacobian finite-difference validation ----
+    # ---- Residual diagnostics during iterations ----
+    print()
+    print("=" * 60)
+    print("Residual & Jacobian Profile During Iterations")
+    print("=" * 60)
+    
+    if 'iteration_diagnostics' in res_div and res_div['iteration_diagnostics']:
+        for diag in res_div['iteration_diagnostics']:
+            it = diag['iteration']
+            print(f"\n{'='*80}")
+            print(f"ITERATION {it} (RMSE = {diag['rmse']:.6e})")
+            print(f"{'='*80}")
+            
+            for div_info in diag['dividends']:
+                div_num = div_info['div_num']
+                t_d = div_info['t_d']
+                y_d = div_info['y_d']
+                idx_B = div_info['idx_B']
+                start_B = div_info['start_B']
+                
+                print(f"\nDividend {div_num} at t={t_d:.3f} (y={y_d:.6f}), B-index={idx_B}")
+                print(f"Max |residual| in window: {div_info['max_abs_residual']:.6e}")
+                print(f"\n  {'B-Idx':<6} {'y':<14} {'B(y)':<16} {'Residual':<16} {'Jac[i,i]':<16}")
+                print("  " + "-" * 78)
+                
+                y_vals = div_info['y_values']
+                B_vals = div_info['boundary']
+                res_vals = div_info['residuals']
+                jac_vals = div_info['jac_diagonal']
+                
+                # Key insight: res_vals is a window extracted from the full residual array
+                # B_vals[k] corresponds to res_vals[k] via shifted indexing
+                for k in range(len(y_vals)):
+                    B_idx = start_B + k
+                    marker = " <-- div" if (B_idx == idx_B or 
+                        (B_idx > 0 and pricer_div.y[B_idx-1] < y_d <= pricer_div.y[B_idx])) else ""
+                    
+                    window_idx = B_idx - start_B - 1
+                    
+                    res_str = f"{res_vals[window_idx]:.8e}" if 0 <= window_idx < len(res_vals) else "N/A"
+                    jac_str = f"{jac_vals[window_idx]:.8e}" if 0 <= window_idx < len(jac_vals) else "N/A"
+                    
+                    # Add detailed residual breakdown for problematic knots
+                    if hasattr(pricer_div, '_last_residual_details') and abs(y_vals[k] - y_d) < 0.01:
+                        details = pricer_div._last_residual_details
+                        euro = details['euro_p'][B_idx] if B_idx < len(details['euro_p']) else 0
+                        eep = details['eep'][B_idx] if B_idx < len(details['eep']) else 0
+                        pv_div = details['pv_divs'][B_idx] if B_idx < len(details['pv_divs']) else 0
+                        intrinsic = pricer_div.w * (B_vals[k] - pricer_div.K)
+                        detail_str = f" [Euro={euro:.4f}, EEP={eep:.4f}, PV(D)={pv_div:.4f}, Int={intrinsic:.4f}]"
+                    else:
+                        detail_str = ""
+                    
+                    print(f"  {B_idx:<6} {y_vals[k]:<14.8f} {B_vals[k]:<16.8f} "
+                          f"{res_str:<16} {jac_str:<16}{marker}{detail_str}")
+
+    # ---- Jacobian test ----
     print()
     print("=" * 60)
     print("Jacobian Finite-Difference Test")
     print("=" * 60)
-
-    # Test on the put case
-    print("\nTesting on American Put:")
-    jac_test_put = test_jacobian_fd(pricer_put, eps=1e-6)
-    print(f"  Max error  : {jac_test_put['max_error']:.6e}")
-    print(f"  Mean error : {jac_test_put['mean_error']:.6e}")
-
-    # Test on the call case
-    print("\nTesting on American Call:")
-    jac_test_call = test_jacobian_fd(pricer_call, eps=1e-6)
-    print(f"  Max error  : {jac_test_call['max_error']:.6e}")
-    print(f"  Mean error : {jac_test_call['mean_error']:.6e}")
-
-    # Test on the discrete dividend case
-    print(f"\nTesting on American {'Call' if do_call else 'Put'} with Dividends:")
     jac_test_div = test_jacobian_fd(pricer_div, eps=1e-6)
     print(f"  Max error  : {jac_test_div['max_error']:.6e}")
     print(f"  Mean error : {jac_test_div['mean_error']:.6e}")
 
-    # ---- Test 5: Initial guess improvement comparison ----
-    print()
-    print("=" * 60)
-    print("Initial Guess Improvement (Discrete Dividends)")
-    print("=" * 60)
+    # ---- Convergence plot ----
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
 
-    # Compute initial residual with OLD method (simple linear interpolation)
-    S_star_old = _ju_critical_price(pricer_div.K, pricer_div.T, pricer_div.r,
-                                     pricer_div.q, pricer_div.sigma, pricer_div.w)
-    log_BK_old = np.log(S_star_old / pricer_div.K) * pricer_div.y / pricer_div.y_max
-    H_old = log_BK_old[1:]
-    res_old, _ = pricer_div.get_residual_and_jac(H_old)
-    residual_old = np.linalg.norm(res_old)
-
-    # Compute initial residual with NEW method (with discrete div adjustment)
-    residual_new = res_div['initial_residual_norm']
-
-    print(f"\n  Old method (linear Ju):    {residual_old:.6e}")
-    print(f"  New method (div-adjusted): {residual_new:.6e}")
-    print(f"  Improvement factor:        {residual_old / residual_new:.2f}x")
-
-    # ---- Test 6: More challenging discrete dividend case ----
-    print()
-    print("=" * 60)
-    print("Challenging Case: Larger Dividends")
-    print("American Put (S=100, K=100, T=1, r=5%, q=0%, sigma=20%)")
-    print("  Discrete dividends: D=5.0 at t=0.25, D=5.0 at t=0.75")
-    print("=" * 60)
-
-    pricer_hard = KimIntegralRBF(
-        K=100, T=1.0, r=0.05, q=0.0, sigma=0.20, w=-1, N=30, n_powers=2,
-        div_times=[0.25, 0.75], div_amounts=[5.0, 5.0])
-    res_hard = pricer_hard.price(S0=100, max_iters=max_iters)
-
-    # Compare with old method
-    S_star_hard_old = _ju_critical_price(pricer_hard.K, pricer_hard.T, pricer_hard.r,
-                                          pricer_hard.q, pricer_hard.sigma, pricer_hard.w)
-    log_BK_hard_old = np.log(S_star_hard_old / pricer_hard.K) * pricer_hard.y / pricer_hard.y_max
-    H_hard_old = log_BK_hard_old[1:]
-    res_hard_old, _ = pricer_hard.get_residual_and_jac(H_hard_old)
-    residual_hard_old = np.linalg.norm(res_hard_old)
-    residual_hard_new = res_hard['initial_residual_norm']
-
-    print(f"\n  Old method (linear Ju):    {residual_hard_old:.6e}")
-    print(f"  New method (div-adjusted): {residual_hard_new:.6e}")
-    print(f"  Improvement factor:        {residual_hard_old / residual_hard_new:.2f}x")
-    print(f"\n  American Put Price: {res_hard['amer']:.8f}")
-
-    # ---- Convergence plots ----
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
-    ax = axes[0]
-    for label, (B, rmse) in res_put["history"].items():
-        alpha = 0.8 if label==list(res_put["history"].keys())[-1] else 0.2
-        ax.plot(pricer_put.y ** 2, B, label=f"{label} RMSE={rmse:.2e}", alpha=alpha)
-    ax.set_title("Put Boundary Convergence")
-    ax.set_xlabel(r"$\tau = y^2$")
-    ax.set_ylabel("B(tau)")
-    ax.invert_xaxis()
-    ax.legend(ncol=1, fontsize=7)
-    ax.grid(alpha=0.3)
-
-    ax = axes[1]
-    for label, (B, rmse) in res_call["history"].items():
-        alpha = 0.8 if label==list(res_call["history"].keys())[-1] else 0.2
-        ax.plot(pricer_call.y ** 2, B, label=f"{label} RMSE={rmse:.2e}", alpha=alpha)
-    ax.set_title("Call Boundary Convergence")
-    ax.set_xlabel(r"$\tau = y^2$")
-    ax.set_ylabel("B(tau)")
-    ax.invert_xaxis()
-    ax.legend(ncol=1, fontsize=7)
-    ax.grid(alpha=0.3)
-
-    ax = axes[2]
     for label, (B, rmse) in res_div["history"].items():
         alpha = 0.8 if label==list(res_div["history"].keys())[-1] else 0.2
         ax.plot(pricer_div.y ** 2, B, label=f"{label} RMSE={rmse:.2e}", alpha=alpha)
 
-    print(res_div["history"])
-    
+    # Mark dividend times
     for t_d, D in pricer_div.div_schedule:
-        ax.axvline(pricer_div.T - t_d, color="gray", ls="--", lw=0.8)
-    ax.set_title(f"{'Call' if do_call else 'Put'} + Discrete Div Boundary")
+        ax.axvline(pricer_div.T - t_d, color="red", ls="--", lw=1.2, alpha=0.7)
+    
+    ax.set_title(f"American Call with Discrete Dividends - Boundary Convergence")
     ax.set_xlabel(r"$\tau = y^2$")
     ax.set_ylabel("B(tau)")
     ax.invert_xaxis()
-    ax.legend(ncol=1, fontsize=7)
+    ax.legend(ncol=1, fontsize=9)
     ax.grid(alpha=0.3)
 
     plt.tight_layout()
