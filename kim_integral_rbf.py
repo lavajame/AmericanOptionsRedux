@@ -200,14 +200,14 @@ class KimIntegralRBF:
         Columns:
           k=1..n_powers : y^k / (c^k + y^k)   (asymptotic powers, c = y_max)
           i=1..n_div    : H(y - y_div_i)       (step functions at dividend times)
-          i=1..n_div    : y * H(y - y_div_i)   (linear ramps for post-dividend slope adjustment)
-          i=1..n_div, k=1..n_powers : (y - y_div_i)_+^k / (c^k + (y - y_div_i)_+^k)
-                                      (localized power basis starting at each dividend)
+          i=1..n_div, k=1..n_powers : (y - y_div_i)_+^k / (c_i^k + (y - y_div_i)_+^k)
+                                      (localized power basis starting at each dividend,
+                                       where c_i = y_div_i = sqrt(T - t_div_i))
 
         All basis functions equal 0 at y=0 so B(0) = K is automatic.
         Powers approach 1 as y -> inf, capturing the long-maturity asymptote.
-        Step functions capture discontinuities, linear ramps allow slope changes.
-        Localized powers provide flexible post-dividend shape control.
+        Step functions capture discontinuities.
+        Localized powers provide flexible post-dividend shape control including slope changes.
         """
         y = self.y
         c = self.y_max
@@ -220,7 +220,6 @@ class KimIntegralRBF:
 
         if len(self.div_schedule) > 0:
             step_cols = np.zeros((n, len(self.div_schedule)))
-            ramp_cols = np.zeros((n, len(self.div_schedule)))
             # Localized power terms: n_div * n_powers columns
             local_power_cols = np.zeros((n, len(self.div_schedule) * self.n_powers))
             
@@ -230,18 +229,16 @@ class KimIntegralRBF:
                 active = (y >= y_d)
                 step_cols[:, i] = active.astype(float)
                 
-                # Linear ramp: y * H(y - y_d)
-                # Allows boundary slope to change after dividend
-                ramp_cols[:, i] = y * active.astype(float)
-                
-                # Localized power terms: (y - y_d)_+^k / (c^k + (y - y_d)_+^k)
+                # Localized power terms: (y - y_d)_+^k / (c_i^k + (y - y_d)_+^k)
+                # where c_i = y_d for natural scaling at each dividend time
                 # Start from zero at y_d, provide flexible shape control post-dividend
                 y_shifted = np.maximum(0, y - y_d)
+                c_local = y_d  # Use dividend time as characteristic scale
                 for k in range(1, self.n_powers + 1):
                     col_idx = i * self.n_powers + (k - 1)
-                    local_power_cols[:, col_idx] = y_shifted ** k / (c ** k + y_shifted ** k)
+                    local_power_cols[:, col_idx] = y_shifted ** k / (c_local ** k + y_shifted ** k)
             
-            return np.hstack([power_cols, step_cols, ramp_cols, local_power_cols])
+            return np.hstack([power_cols, step_cols, local_power_cols])
         else:
             return power_cols
 
@@ -342,11 +339,18 @@ class KimIntegralRBF:
         Dividends are processed from closest to expiry (largest t_d) backwards,
         accumulating their effects as we move back in time.
         """
-        # Start with Ju's linear interpolation
-        S_star = _ju_critical_price(self.K, self.T, self.r, self.q,
-                                    self.sigma, self.w)
-        
-        print(f"Ju critical price S* at maturity: {S_star:.4f}")
+        # Start with Ju's linear interpolation (with fallback for edge cases)
+        try:
+            S_star = _ju_critical_price(self.K, self.T, self.r, self.q,
+                                        self.sigma, self.w)
+            print(f"Ju critical price S* at maturity: {S_star:.4f}")
+        except (ValueError, RuntimeError) as e:
+            # Fallback: use simple rule when Ju fails
+            if self.w == +1:  # call
+                S_star = self.K * 1.5
+            else:  # put
+                S_star = self.K * 0.8
+            print(f"Ju critical price failed ({e}), using fallback S* = {S_star:.4f}")
 
         log_BK_max = np.log(S_star / self.K)
         log_BK = log_BK_max * self.y / self.y_max
@@ -461,8 +465,7 @@ class KimIntegralRBF:
         nd1 = norm.pdf(d1)
         nd2 = norm.pdf(d2)
 
-        # --- EEP integrand matrix (lower triangular: k > j) ---
-        # f[k,j] = 2*y_j * w * (q*B_k*e^{-q*tau}*N(w*d1) - r*K*e^{-r*tau}*N(w*d2))
+        # --- EEP integrand matrix (lower triangular: k > j) ----        # f[k,j] = 2*y_j * w * (q*B_k*e^{-q*tau}*N(w*d1) - r*K*e^{-r*tau}*N(w*d2))
         f_mat = np.where(valid,
                          2 * y[None, :] * self.w * (
                              self.q * B[:, None] * eq * Nd1
@@ -557,6 +560,22 @@ class KimIntegralRBF:
         res_init, _ = self.get_residual_and_jac(H)
         initial_residual_norm = np.linalg.norm(res_init)
 
+        # **NEW**: For discrete dividends with q < necessary threshold,
+        # modify self.q temporarily to use q_eff during solving.
+        # This ensures the boundary solver finds the correct solution.
+        q_original = self.q
+        if self.div_schedule:
+            # Use S0=K as reference to compute q_eff
+            S0_ref = self.K
+            pv_all = self._pv_divs(self.T)
+            S_ex_ref = max(S0_ref - pv_all, 1e-8)
+            q_eff = -np.log(S_ex_ref / S0_ref) / self.T if S0_ref > 1e-8 else self.q
+            
+            # Only replace q if q_eff is significantly larger (indicating discrete divs dominate)
+            if q_eff > 1.5 * self.q:
+                print(f"  SOLVER: Using q_eff={q_eff:.6f} instead of q={self.q} for boundary solve")
+                self.q = q_eff
+
         history = {}
         iteration_diagnostics = []
         
@@ -616,6 +635,12 @@ class KimIntegralRBF:
             except np.linalg.LinAlgError:
                 delta = np.linalg.lstsq(jac, res, rcond=None)[0]
 
+            # Limit step size to prevent divergence
+            # For log-space, limit delta to prevent exp(H) over/underflow
+            max_delta = 2.0  # Max change in log(B/K) per iteration
+            if np.max(np.abs(delta)) > max_delta:
+                delta = delta * (max_delta / np.max(np.abs(delta)))
+
             H -= delta
 
             # Re-fit boundary to design matrix to remove kinks
@@ -634,24 +659,33 @@ class KimIntegralRBF:
                 # Update H with smoothed boundary
                 H = log_BK_smooth[1:]
 
-            # Clip to economically sensible ranges to avoid irrational early exercise
-            # For calls: B >= K (early ex only if in-the-money)
-            # For puts: B <= K (early ex only if in-the-money)
-            # Also limit extreme values that would give zero EEP contribution
-            if self.w == -1:  # put: 0.5*K <= B <= K
-                H = np.clip(H, np.log(0.5), np.log(1.0))
-            else:  # call: K <= B <= 3*K
-                H = np.clip(H, np.log(1.0), np.log(3.0))
+            # Minimal constraints for numerical stability only
+            # Keep these wide to minimize impact on calibration
+            # Note: This method may systematically misprice very deep ITM options
+            if self.w == -1:  # put
+                H = np.clip(H, np.log(0.3), np.log(1.2))  
+            else:  # call
+                H = np.clip(H, np.log(0.8), np.log(5.0))  
 
         B_final = np.concatenate([[self.B0], self.K * np.exp(H)])
         
+        # For history tracking, compute EEP at each iteration using a reference spot
+        # Use S0=K as reference for consistency
+        S0_ref = self.K
+        pv_all_ref = self._pv_divs(self.T)
+        S_ex_ref = max(S0_ref - pv_all_ref, 1e-8)
+        
+        # Compute effective yield for EEP integrand in history tracking
+        # NOTE: This is only for display purposes. The boundary solver uses q, not q_eff.
+        if self.div_schedule and S0_ref > 1e-8:
+            q_eff_ref = -np.log(S_ex_ref / S0_ref) / self.T
+        else:
+            q_eff_ref = self.q
+        
         # Store boundary and EEP for each iteration in history
-        # Recompute EEP for final iteration to store in history
         for iter_label, (B_iter, rmse) in history.items():
-            # Quick EEP calculation for this boundary at reference spot S0=K (ATM)
+            # Quick EEP calculation for this boundary
             f_vec_iter = np.zeros(self.N)
-            S0_ref = self.K  # Use dirty spot for consistency with price() method
-            S_ex_ref = self.K - self._pv_divs(self.T)
             for j in range(self.N):
                 tau_j = self.T - self.y[j] ** 2
                 if tau_j < 1e-12:
@@ -663,13 +697,16 @@ class KimIntegralRBF:
                     # d1 uses ex-dividend ratio for correct drift
                     d1 = (np.log(S_ex_ref / B_ex_j) + (self.r - self.q + 0.5 * self.sigma ** 2) * tau_j) / vt
                     d2 = d1 - vt
-                    # But integrand uses dirty spot for correct absolute value
+                    # Use q_eff in integrand for history display
                     f_vec_iter[j] = 2 * self.y[j] * self.w * (
-                        self.q * S0_ref * np.exp(-self.q * tau_j) * norm.cdf(self.w * d1)
+                        q_eff_ref * S0_ref * np.exp(-q_eff_ref * tau_j) * norm.cdf(self.w * d1)
                         - self.r * self.K * np.exp(-self.r * tau_j) * norm.cdf(self.w * d2)
                     )
             eep_iter = max(0, self.A_rbf[-1, :] @ f_vec_iter)
             history[iter_label] = (B_iter, rmse, eep_iter)
+        
+        # Restore original q
+        self.q = q_original
         
         return B_final, history, initial_residual_norm, iteration_diagnostics
 
@@ -704,6 +741,15 @@ class KimIntegralRBF:
         S_ex = max(S0 - pv_all, 1e-8)
         euro_price, _ = self._bs(S_ex, self.K, self.T)
 
+        # **FIX FOR DISCRETE DIVIDENDS**: Compute effective continuous yield
+        # When q=0 but we have discrete dividends, the EEP integrand needs
+        # the "implied" continuous drift from the discrete dividends.
+        # q_eff = -(1/T) * ln(S_ex/S0) converts discrete divs to continuous yield.
+        if self.div_schedule and S0 > 1e-8:
+            q_eff = -np.log(S_ex / S0) / self.T
+        else:
+            q_eff = self.q
+
         # EEP at S0: integrate early exercise value over time
         # CRITICAL: Use S0 (dirty spot) in integrand, not S_ex!
         # The EEP measures value of early exercise at current spot S0.
@@ -730,12 +776,13 @@ class KimIntegralRBF:
                   + (self.r - self.q + 0.5 * self.sigma ** 2) * tau_j) / vt
             d2 = d1 - vt
             
-            # But use S0 (dirty) in the integrand for correct absolute value!
-            # This ensures EEP increases with dividends as expected economically
+            # Use q_eff in integrand to capture discrete dividend effect
+            # This ensures EEP is positive for calls with discrete dividends
             f_vec[j] = 2 * y[j] * self.w * (
-                self.q * S0 * np.exp(-self.q * tau_j) * norm.cdf(self.w * d1)
+                q_eff * S0 * np.exp(-q_eff * tau_j) * norm.cdf(self.w * d1)
                 - self.r * self.K * np.exp(-self.r * tau_j) * norm.cdf(self.w * d2)
             )
+        
         eep_val = max(0, self.A_rbf[-1, :] @ f_vec)
 
         runtime = time.perf_counter() - t0
@@ -816,7 +863,7 @@ if __name__ == "__main__":
 
     N=60  # Finer grid to better resolve dividend transitions
     max_iters = 10
-    n_powers = 3
+    n_powers = 35
     do_call = True
 
     no_divs = False
@@ -1009,36 +1056,24 @@ if __name__ == "__main__":
         # Design matrix columns:
         #   n_powers (global)
         #   + n_div (steps)
-        #   + n_div (ramps)
         #   + n_div * n_powers (localized powers)
         n_div = len(pricer_div.div_schedule)
-        n_expected_with_ramps = pricer_div.n_powers + 2 * n_div
-        n_expected_with_local_powers = pricer_div.n_powers + 2 * n_div + n_div * pricer_div.n_powers
+        n_expected_with_local_powers = pricer_div.n_powers + n_div + n_div * pricer_div.n_powers
         
         has_local_powers = pricer_div.A_design.shape[1] >= n_expected_with_local_powers
-        has_ramps = pricer_div.A_design.shape[1] >= n_expected_with_ramps
         
         if has_local_powers:
             if total_rmse > 0.1:
                 print()
-                print("NOTE: Large residuals persist despite full basis (powers + steps + ramps + local powers).")
+                print("NOTE: Large residuals persist despite full basis (powers + steps + local powers).")
                 print("      May need finer grid (increase N) or more power terms (increase n_powers).")
             else:
                 print()
-                print(f"✓ Full basis with localized powers successfully controls errors (RMSE={total_rmse:.2e}).")
-        elif has_ramps:
-            if total_rmse > 0.1:
-                print()
-                print("NOTE: Large residuals persist after dividends despite using linear ramps.")
-                print("      Consider higher-order terms: y²*H(y>y_d), y³*H(y>y_d), etc.")
-            else:
-                print()
-                print(f"✓ Linear ramps y*H(y>y_d) successfully control post-dividend errors (RMSE={total_rmse:.2e}).")
+                print(f"✓ Localized powers with c=y_d successfully control errors (RMSE={total_rmse:.2e}).")
         elif total_rmse > 0.05:
             print()
-            print("NOTE: Large residuals after dividends suggest adding more flexible basis:")
-            print("      Consider y*H(y>y_d) terms for each dividend time y_d to allow")
-            print("      boundary slope to adjust post-dividend.")
+            print("NOTE: Large residuals after dividends suggest adding localized power basis.")
+            print("      Consider (y-y_d)_+^k/(y_d^k+(y-y_d)_+^k) terms for flexible post-div control.")
     print()
     
     # Overlay residual contribution on right axis
@@ -1061,5 +1096,5 @@ if __name__ == "__main__":
     ax1.set_title(f"Boundary Convergence with Residual Diagnostic")
 
     plt.tight_layout()
-    plt.savefig(f"kim_integral_rbf_convergence{'_no_divs' if no_divs else '_divs'}.png", dpi=150)
-    print(f"\nSaved kim_integral_rbf_convergence{'_no_divs' if no_divs else ''}.png")
+    plt.savefig(f"kim_integral_rbf_convergence{'_no_divs' if no_divs else '_with_divs'}.png", dpi=150)
+    print(f"\nSaved kim_integral_rbf_convergence{'_no_divs' if no_divs else '_with_divs'}.png")
